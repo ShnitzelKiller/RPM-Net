@@ -3,6 +3,32 @@ import os.path
 import numpy as np
 import sys
 
+class TestPoints():
+    def __init__(self, data_path, ext='.txt', num_point=2048):
+        self.data_path = data_path
+        self.num_point = num_point
+        self.datalist = [os.path.join(self.data_path, f.name) for f in os.scandir(self.data_path) if f.name.endswith(ext)]
+        print('DATALIST:', self.datalist)
+    
+    def __getitem__(self, index):
+        return np.loadtxt(self.datalist[index]).astype(np.float32)
+
+    def __len__(self):
+            return len(self.datalist)
+
+    def get_name(self, idxs):
+        # get corresponding pointcloud names from index
+        return os.path.splitext(os.path.split(self.datalist[idxs])[1])[0]
+
+    def get_batch(self, idxs, start_idx, end_idx):
+        bsize = end_idx-start_idx
+        batch_pc = np.zeros((bsize, self.num_point, 3))
+        for i in range(bsize):
+            pc = self.__getitem__(idxs[i+start_idx])
+            batch_pc[i,:,:] = pc[:self.num_point, :]
+
+        return batch_pc
+
 class MotionDataset():
     def __init__(self, 
     data_path,

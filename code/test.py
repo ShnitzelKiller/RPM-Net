@@ -26,6 +26,8 @@ parser.add_argument('--num_frame', type=int, default=5, help='Frames number need
 parser.add_argument('--batch_size', type=int, default=1, help='Batch Size during training [default: 16]')
 parser.add_argument('--model_path', default='../output/YOUR_MODEL_PATH/ckpts/model.ckpt-90', help='model checkpoint file path [default: log/model.ckpt]')
 parser.add_argument('--eval_dir', default='../output/YOUR_MODEL_PATH/eval/', help='eval folder path')
+parser.add_argument('--data_path', default='/fast/jamesn8/RPMNet/')
+parser.add_argument('--data_type', choices=['default', 'pointfolder'], default='default')
 FLAGS = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"]=str(FLAGS.gpu)
@@ -35,12 +37,14 @@ NUM_FRAME = FLAGS.num_frame
 GPU_INDEX = FLAGS.gpu
 TRAIN_LIST = FLAGS.train_list
 TEST_LIST = FLAGS.test_list
-DATA_PATH = os.path.join(ROOT_DIR, '../data/')
+#DATA_PATH = os.path.join(ROOT_DIR, '../data/')
+DATA_PATH = FLAGS.data_path
 
 EVAL_DIR = FLAGS.eval_dir
 if not os.path.exists(EVAL_DIR): os.mkdir(EVAL_DIR)
 if not os.path.exists(EVAL_DIR+'/pointcloud'): os.mkdir(EVAL_DIR+'/pointcloud')
 if not os.path.exists(EVAL_DIR+'/seg'): os.mkdir(EVAL_DIR+'/seg')
+if not os.path.exists(EVAL_DIR+'/disp'): os.mkdir(EVAL_DIR+'/disp')
 LOG_FOUT = open(os.path.join(EVAL_DIR, 'log_evaluate.txt'), 'w')
 LOG_FOUT.write(str(FLAGS)+'\n')
 
@@ -48,7 +52,10 @@ MODEL = importlib.import_module(FLAGS.model) # import network module
 MODEL_PATH = FLAGS.model_path
 
 # Shapenet official train/test split
-TEST_DATASET = dataset.MotionDataset(data_path=DATA_PATH, train_list=TRAIN_LIST, test_list=TEST_LIST, num_point=NUM_POINT, num_frame=NUM_FRAME, split='test', batch_size=BATCH_SIZE)
+if FLAGS.data_type == 'default':
+	TEST_DATASET = dataset.MotionDataset(data_path=DATA_PATH, train_list=TRAIN_LIST, test_list=TEST_LIST, num_point=NUM_POINT, num_frame=NUM_FRAME, split='test', batch_size=BATCH_SIZE)
+else:
+	TEST_DATASET = dataset.TestPoints(data_path=DATA_PATH, num_point=NUM_POINT)
 
 def log_string(out_str):
 	LOG_FOUT.write(out_str+'\n')
@@ -104,36 +111,53 @@ def eval_one_epoch(sess, ops):
 	for batch_idx in range(num_batches):
 		start_idx = batch_idx * BATCH_SIZE
 		end_idx = (batch_idx+1) * BATCH_SIZE
-		batch_pc, batch_pc_target, batch_disp_target, batch_mov_seg, batch_part_seg = TEST_DATASET.get_batch(test_idxs, start_idx, end_idx)
 
-		feed_dict = {ops['pointclouds_pl']: batch_pc,
-					 ops['pc_target_pl']: batch_pc_target,
-					 ops['disp_target_pl']: batch_disp_target,
-					 ops['part_seg_pl']: batch_part_seg,
-					 ops['is_training_pl']: is_training}
-		pred_pc_val, pred_seg_val, simmat_logits_val = sess.run([ops['pred_pc'], ops['pred_seg'], ops['simmat_logits']], feed_dict=feed_dict)
-	
-		pred_seg_label = np.argmax(pred_seg_val[0], 1)
-		correct_seg = np.sum(pred_seg_label == batch_mov_seg[0])
-		total_correct_seg += correct_seg
-		total_seen_seg += NUM_POINT
-	
-		simmat = simmat_logits_val[0]
+		if FLAGS.data_type=='default':
+			batch_pc, batch_pc_target, batch_disp_target, batch_mov_seg, batch_part_seg = TEST_DATASET.get_batch(test_idxs, start_idx, end_idx)
 
-		out_name = TEST_DATASET.get_name(batch_idx)
-		ptspos = batch_pc[0,:,:3]
-		mov_seg = pred_seg_label
-		gt_part_seg = batch_part_seg[0]
+			feed_dict = {ops['pointclouds_pl']: batch_pc,
+						ops['pc_target_pl']: batch_pc_target,
+						ops['disp_target_pl']: batch_disp_target,
+						ops['part_seg_pl']: batch_part_seg,
+						ops['is_training_pl']: is_training}
+			pred_pc_val, pred_seg_val, simmat_logits_val = sess.run([ops['pred_pc'], ops['pred_seg'], ops['simmat_logits']], feed_dict=feed_dict)
+			pred_seg_label = np.argmax(pred_seg_val[0], 1)
+			correct_seg = np.sum(pred_seg_label == batch_mov_seg[0])
+			total_correct_seg += correct_seg
+			total_seen_seg += NUM_POINT
+		
+			simmat = simmat_logits_val[0]
 
-		if np.sum(mov_seg) <= 64:
-			part_seg = np.zeros((NUM_POINT))
-			log_string("WARING: mov points less than 64")
+			out_name = TEST_DATASET.get_name(batch_idx)
+			ptspos = batch_pc[0,:,:3]
+			mov_seg = pred_seg_label
+			gt_part_seg = batch_part_seg[0]
+
+			if np.sum(mov_seg) <= 64:
+				part_seg = np.zeros((NUM_POINT))
+				log_string("WARING: mov points less than 64")
+			else:
+				part_seg, proposals = cluster.GroupMergingSimDist(ptspos, simmat, mov_seg)
+				ap = cluster.ComputeAP( part_seg, gt_part_seg )
+				sum_ap += ap
+				log_string('%d: %s'%(batch_idx, out_name))
+				log_string('EVAL: AP: %f, movmask_acc: %f\n' % (ap, correct_seg / NUM_POINT))
 		else:
-			part_seg, proposals = cluster.GroupMergingSimDist(ptspos, simmat, mov_seg)
-			ap = cluster.ComputeAP( part_seg, gt_part_seg )
-			sum_ap += ap
-			log_string('%d: %s'%(batch_idx, out_name))
-			log_string('EVAL: AP: %f, movmask_acc: %f\n' % (ap, correct_seg / NUM_POINT))
+			batch_pc = TEST_DATASET.get_batch(test_idxs, start_idx, end_idx)
+			feed_dict = {ops['pointclouds_pl']: batch_pc,
+						ops['is_training_pl']: is_training}
+			pred_pc_val, pred_seg_val, simmat_logits_val = sess.run([ops['pred_pc'], ops['pred_seg'], ops['simmat_logits']], feed_dict=feed_dict)
+			pred_seg_label = np.argmax(pred_seg_val[0], 1)
+			simmat = simmat_logits_val[0]
+
+			out_name = TEST_DATASET.get_name(batch_idx)
+			ptspos = batch_pc[0,:,:3]
+			mov_seg = pred_seg_label
+			if np.sum(mov_seg) <= 64:
+				part_seg = np.zeros((NUM_POINT))
+				log_string("WARING: mov points less than 64")
+			else:
+				part_seg, proposals = cluster.GroupMergingSimDist(ptspos, simmat, mov_seg)
 
 		for frame in range(NUM_FRAME):
 			np.savetxt(EVAL_DIR+'/pointcloud/'+out_name+'_'+str(frame+1)+'.pts', pred_pc_val[0,frame], fmt='%.8f')
@@ -142,9 +166,10 @@ def eval_one_epoch(sess, ops):
 			for i in range(NUM_POINT):
 				f.writelines(str(part_seg[i])+'\n')
 
-	log_string('----------------STATISTICS----------------')
-	log_string('Mean Mov mask Accuracy: %f'% (total_correct_seg / float(total_seen_seg)))
-	log_string('Mean Average Precision: %f'%(sum_ap / num_batches))
+	if FLAGS.data_type == 'default':
+		log_string('----------------STATISTICS----------------')
+		log_string('Mean Mov mask Accuracy: %f'% (total_correct_seg / float(total_seen_seg)))
+		log_string('Mean Average Precision: %f'%(sum_ap / num_batches))
 
 if __name__ == "__main__":
 	log_string('pid: %s'%(str(os.getpid())))

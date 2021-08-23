@@ -2,3 +2,9 @@
 venv/
 .vscode/
 __pycache__/
+output/
+data/
+#*
+*#
+.#*
+.ipynb_checkpoints/
